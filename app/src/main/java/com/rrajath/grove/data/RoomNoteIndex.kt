@@ -2,6 +2,7 @@ package com.rrajath.grove.data
 
 import com.rrajath.grove.attach.attachDirProperty
 import com.rrajath.grove.attach.fileAttachDirProperty
+import com.rrajath.grove.markdown.MarkdownTaskParser
 import com.rrajath.grove.org.OrgDocument
 import com.rrajath.grove.org.OrgKeywords
 import com.rrajath.grove.org.OrgParser
@@ -14,35 +15,23 @@ import com.rrajath.grove.sync.NotebookStub
 class RoomNoteIndex(
     private val db: GroveDatabase,
     private val keywords: () -> OrgKeywords = { OrgKeywords.DEFAULT },
-    /**
-     * Notified with the freshly parsed [com.rrajath.grove.org.OrgDocument] right
-     * after each notebook is (re)indexed, so e.g. reminder reconciliation can run
-     * per-file instead of waiting for the whole vault to finish syncing.
-     */
-    private val onIndexed: suspend (fileName: String, doc: com.rrajath.grove.org.OrgDocument) -> Unit = { _, _ -> },
+    /** Called after indexing for file-specific side effects (currently Org reminders). */
+    private val onIndexed: suspend (fileName: String, doc: OrgDocument) -> Unit = { _, _ -> },
 ) : NoteIndex {
 
     private val dao get() = db.indexDao()
 
     override suspend fun knownNotebooks(): Map<String, KnownNotebook> =
-        dao.notebookSyncStates().associate {
-            it.fileName to KnownNotebook(it.revision, it.conflictFileName, it.isIndexed)
-        }
+        dao.notebookSyncStates().associate { it.fileName to KnownNotebook(it.revision, it.conflictFileName, it.isIndexed) }
 
     override suspend fun stubNotebooks(stubs: List<NotebookStub>) {
-        dao.insertNotebookStubs(
-            stubs.map {
-                NotebookEntity(
-                    fileName = it.fileName,
-                    revision = it.revision,
-                    noteCount = 0,
-                    lastModified = it.lastModified,
-                    conflictFileName = it.conflictFileName,
-                    title = null,
-                    isIndexed = false,
-                )
-            }
-        )
+        dao.insertNotebookStubs(stubs.map {
+            NotebookEntity(
+                fileName = it.fileName, revision = it.revision, noteCount = 0,
+                lastModified = it.lastModified, conflictFileName = it.conflictFileName,
+                title = null, isIndexed = false,
+            )
+        })
     }
 
     override suspend fun indexNotebook(
@@ -52,7 +41,16 @@ class RoomNoteIndex(
         lastModified: Long,
         conflictFileName: String?,
     ) {
-        val doc = OrgParser.parse(text, keywords())
+        val configuredKeywords = keywords()
+        if (fileName.endsWith(".md", ignoreCase = true)) {
+            indexMarkdown(fileName, revision, text, lastModified, conflictFileName, configuredKeywords)
+            // Markdown tasks do not carry Org reminders. Deliver an empty Org parse
+            // to maintain the index callback contract and clear any obsolete rows.
+            onIndexed(fileName, OrgParser.parse("", configuredKeywords))
+            return
+        }
+
+        val doc = OrgParser.parse(text, configuredKeywords)
         val inheritedTagsAll = doc.inheritedTagsAll()
         val notes = doc.headlines.mapIndexed { i, h ->
             NoteEntity(
@@ -67,9 +65,7 @@ class RoomNoteIndex(
                 scheduled = h.planning.scheduled?.format(),
                 deadline = h.planning.deadline?.format(),
                 closed = h.planning.closed?.format(),
-                activeTimestamps = h.activeTimestamps
-                    .takeIf { it.isNotEmpty() }
-                    ?.joinToString(" ") { it.format() },
+                activeTimestamps = h.activeTimestamps.takeIf { it.isNotEmpty() }?.joinToString(" ") { it.format() },
                 orgId = h.id,
                 customId = h.customId,
                 createdAt = h.properties["CREATED"],
@@ -83,10 +79,7 @@ class RoomNoteIndex(
             NotebookEntity(
                 fileName = fileName,
                 revision = revision,
-                // Top-level headings only: subheadings are part of their note. A
-                // intro (if any) counts as one more note.
-                noteCount = doc.headlines.count { it.level == 1 } +
-                    (if (doc.hasIntro) 1 else 0),
+                noteCount = doc.headlines.count { it.level == 1 } + (if (doc.hasIntro) 1 else 0),
                 lastModified = lastModified,
                 conflictFileName = conflictFileName,
                 title = doc.preambleKeywords.firstOrNull { it.first.equals("#+TITLE:", ignoreCase = true) }?.second,
@@ -98,11 +91,59 @@ class RoomNoteIndex(
         onIndexed(fileName, doc)
     }
 
-    /**
-     * The file's intro (its heading-less content) as a single index row (or empty when the
-     * file has no such content). Keyed at [INTRO_LINE_INDEX] so it round-trips
-     * through search results and `NoteRef` like any other note.
-     */
+    private suspend fun indexMarkdown(
+        fileName: String,
+        revision: String,
+        text: String,
+        lastModified: Long,
+        conflictFileName: String?,
+        configuredKeywords: OrgKeywords,
+    ) {
+        val tasks = MarkdownTaskParser.parse(text, configuredKeywords)
+        val notes = tasks.map { task ->
+            val taskBody = buildString {
+                append(task.title)
+                val lines = text.split('\n')
+                var i = task.lineIndex + 1
+                while (i < lines.size && lines[i].isNotBlank() && !Regex("^( *)(?:[-+*]|[0-9]+[.)])[ \\t]+.*$").matches(lines[i])) {
+                    append('\n').append(lines[i].trim())
+                    i++
+                }
+            }
+            NoteEntity(
+                fileName = fileName,
+                lineIndex = task.lineIndex,
+                level = task.level,
+                title = task.title,
+                keyword = task.keyword,
+                priority = task.priority?.toString(),
+                tags = task.tags.joinToString(":"),
+                inheritedTags = task.tags.joinToString(":"),
+                scheduled = null,
+                deadline = null,
+                closed = null,
+                activeTimestamps = null,
+                orgId = null,
+                customId = null,
+                createdAt = null,
+                body = taskBody,
+                isDone = configuredKeywords.isDone(task.keyword),
+                lastModified = lastModified,
+            )
+        }
+        dao.replaceNotebook(
+            NotebookEntity(
+                fileName = fileName,
+                revision = revision,
+                noteCount = tasks.count { it.parentLineIndex == null },
+                lastModified = lastModified,
+                conflictFileName = conflictFileName,
+                title = null,
+            ),
+            notes,
+        )
+    }
+
     private fun introNote(doc: OrgDocument, fileName: String, lastModified: Long): List<NoteEntity> {
         if (!doc.hasIntro) return emptyList()
         return listOf(
@@ -125,7 +166,7 @@ class RoomNoteIndex(
                 body = doc.introBody.joinToString("\n").trim(),
                 isDone = false,
                 lastModified = lastModified,
-            )
+            ),
         )
     }
 

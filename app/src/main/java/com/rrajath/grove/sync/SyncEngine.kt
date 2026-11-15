@@ -11,14 +11,6 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.atomic.AtomicInteger
 
-/**
- * Sync state machine (PRD §13): Idle → Checking → Pulling → Done/Conflict/Error.
- * For the v1 Local Directory backend the .org files on disk ARE the source of
- * truth, so "pulling" means re-indexing files whose revision changed (Syncthing
- * or any other tool may rewrite them at any time). Merging/Pushing states exist
- * for the v2 remote backends (WebDAV/Dropbox) which implement [FileStore]
- * against a remote and add an upload leg.
- */
 sealed class SyncState {
     data object Idle : SyncState()
     data object Checking : SyncState()
@@ -30,56 +22,26 @@ sealed class SyncState {
 data class SyncResult(
     val pulled: List<String>,
     val removed: List<String>,
-    /** Notebook file name → Syncthing conflict copy file name. */
     val conflicts: Map<String, String>,
     val completedAt: Long,
 )
 
-/**
- * Indexed state the engine diffs against the store. [isIndexed] is false for a
- * stub row (file discovered but not yet parsed) so the engine re-parses it even
- * if the revision already matches, e.g. after a sync interrupted mid-parse.
- */
-data class KnownNotebook(
-    val revision: String,
-    val conflictFileName: String?,
-    val isIndexed: Boolean = true,
-)
-
-/** Lightweight placeholder for a newly-discovered file, written before parsing. */
-data class NotebookStub(
-    val fileName: String,
-    val revision: String,
-    val lastModified: Long,
-    val conflictFileName: String?,
-)
+data class KnownNotebook(val revision: String, val conflictFileName: String?, val isIndexed: Boolean = true)
+data class NotebookStub(val fileName: String, val revision: String, val lastModified: Long, val conflictFileName: String?)
 
 /** Persistence boundary so the engine is unit-testable without Room. */
 interface NoteIndex {
-    /** Last indexed state per notebook file name. */
     suspend fun knownNotebooks(): Map<String, KnownNotebook>
-
-    /**
-     * Bulk-write placeholder rows for newly-discovered files in one shot, so
-     * the notebook list surfaces every file immediately; [indexNotebook] then
-     * fills in each notebook's real detail in the background.
-     */
     suspend fun stubNotebooks(stubs: List<NotebookStub>)
-
-    suspend fun indexNotebook(
-        fileName: String,
-        revision: String,
-        text: String,
-        lastModified: Long,
-        conflictFileName: String?,
-    )
-
-    /** Update only the conflict marker (file content unchanged). */
+    suspend fun indexNotebook(fileName: String, revision: String, text: String, lastModified: Long, conflictFileName: String?)
     suspend fun setConflict(fileName: String, conflictFileName: String?)
-
     suspend fun removeNotebook(fileName: String)
 }
 
+/**
+ * Sync state machine over source files. Org and Markdown files share discovery,
+ * revision tracking, ignore rules and the same rebuildable Room index.
+ */
 class SyncEngine(
     private val store: FileStore,
     private val index: NoteIndex,
@@ -87,64 +49,31 @@ class SyncEngine(
 ) {
     private val _state = MutableStateFlow<SyncState>(SyncState.Idle)
     val state: StateFlow<SyncState> = _state
-
     val revision: (FileEntry) -> String = { "${it.lastModified}:${it.size}" }
 
-    companion object {
-        private const val PARSE_CONCURRENCY = 3
-    }
+    companion object { private const val PARSE_CONCURRENCY = 3 }
 
     suspend fun sync(log: (String) -> Unit = {}): SyncResult? {
         _state.value = SyncState.Checking
         return try {
             val entries = store.list()
-
-            // Notebook file name -> conflict copy; non-.org conflict copies (an
-            // image, a stray file Syncthing touched) are dropped here so they
-            // never reach the notification/UI layer, which only understands
-            // notebooks.
-            val conflicts = SyncConflicts.detect(entries.map { it.name })
-                .filterKeys { it.endsWith(".org") }
-            val notebooks = entries.filter {
-                it.name.endsWith(".org") && !SyncConflicts.isConflictFile(it.name)
+            val sourceFiles = entries.filter { isSupportedSource(it.name) && !SyncConflicts.isConflictFile(it.name) }
+            val orgNames = sourceFiles.map { it.name }.filter { it.endsWith(".org", ignoreCase = true) }
+            val conflicts = SyncConflicts.detect(entries.map { it.name }).filterKeys { base ->
+                orgNames.any { it.equals(base, ignoreCase = true) }
             }
-
             val known = index.knownNotebooks()
-            val current = notebooks.associateBy({ it.name }, revision)
-            // Re-parse anything not already fully indexed at the current revision:
-            // brand-new files, leftover stubs, and content changes alike.
-            val changed = notebooks.filter {
+            val current = sourceFiles.associateBy({ it.name }, revision)
+            val changed = sourceFiles.filter {
                 val k = known[it.name]
                 k == null || !k.isIndexed || k.revision != current[it.name]
             }
             val removed = (known.keys - current.keys).toList()
-
-            // Discovery/parse split: surface every newly-seen file as a stub in
-            // ONE batch (a single notebooksFlow emission) so the list appears in
-            // full instantly, then parse each below to fill in title/note count.
-            // Only files with no existing row are stubbed, so a content change to
-            // an already-shown notebook keeps its detail until the re-parse lands.
-            val stubs = changed
-                .filter { it.name !in known }
-                .map {
-                    NotebookStub(
-                        fileName = it.name,
-                        revision = current.getValue(it.name),
-                        lastModified = it.lastModified,
-                        conflictFileName = conflicts[it.name],
-                    )
-                }
+            val stubs = changed.filter { it.name !in known }.map {
+                NotebookStub(it.name, current.getValue(it.name), it.lastModified, conflicts[it.name])
+            }
             if (stubs.isNotEmpty()) index.stubNotebooks(stubs)
 
-            // Bounded concurrency, not one file at a time: the read (I/O) and
-            // parse (CPU) for up to PARSE_CONCURRENCY files now overlap instead
-            // of serializing, and a slow per-file side effect (reminder
-            // reconcile, inside index.indexNotebook) no longer blocks the next
-            // file's read from starting (PERFORMANCE_AUDIT_2026-09-16 F1, F5).
-            // No dispatcher is forced here: this inherits whatever dispatcher
-            // the caller is already on (Dispatchers.Default in production via
-            // SyncManager's appScope), which is also what keeps this safe under
-            // a single-threaded TestDispatcher in tests.
             coroutineScope {
                 val semaphore = Semaphore(PARSE_CONCURRENCY)
                 val completed = AtomicInteger(0)
@@ -152,11 +81,8 @@ class SyncEngine(
                     async {
                         semaphore.withPermit {
                             index.indexNotebook(
-                                fileName = entry.name,
-                                revision = current.getValue(entry.name),
-                                text = store.read(entry.name),
-                                lastModified = entry.lastModified,
-                                conflictFileName = conflicts[entry.name],
+                                entry.name, current.getValue(entry.name), store.read(entry.name),
+                                entry.lastModified, conflicts[entry.name],
                             )
                             _state.value = SyncState.Pulling(entry.name, completed.incrementAndGet(), changed.size)
                             log("pulled ${entry.name}")
@@ -164,28 +90,15 @@ class SyncEngine(
                     }
                 }.awaitAll()
             }
-            removed.forEach {
-                index.removeNotebook(it)
-                log("removed $it from index")
-            }
-            // Conflict markers can change without the file content changing
-            // (Syncthing dropping a .sync-conflict copy next to it).
+            removed.forEach { index.removeNotebook(it); log("removed $it from index") }
             val changedNames = changed.mapTo(HashSet()) { it.name }
-            notebooks.forEach { nb ->
-                if (nb.name !in changedNames && known[nb.name]?.conflictFileName != conflicts[nb.name]) {
-                    index.setConflict(nb.name, conflicts[nb.name])
+            sourceFiles.forEach { entry ->
+                if (entry.name !in changedNames && known[entry.name]?.conflictFileName != conflicts[entry.name]) {
+                    index.setConflict(entry.name, conflicts[entry.name])
                 }
             }
             conflicts.forEach { (base, copy) -> log("conflict: $base vs $copy") }
-
-            val result = SyncResult(
-                pulled = changed.map { it.name },
-                removed = removed,
-                conflicts = conflicts,
-                completedAt = clock(),
-            )
-            _state.value = SyncState.Done(result)
-            result
+            SyncResult(changed.map { it.name }, removed, conflicts, clock()).also { _state.value = SyncState.Done(it) }
         } catch (e: Exception) {
             log("sync failed: ${e.message}")
             _state.value = SyncState.Error(e.message ?: "Sync failed")
@@ -193,23 +106,13 @@ class SyncEngine(
         }
     }
 
-    /**
-     * Re-index a single already-known file the caller just wrote, skipping the
-     * whole-directory [list] + revision diff [sync] does. Reads only this file's
-     * metadata via [FileStore.stat] (which [com.rrajath.grove.vault.SafFileStore]
-     * serves as a targeted single-document query, not a full enumeration), so the
-     * cost is independent of vault size. For the in-app single-note save path,
-     * where the changed file and its new text are already in hand.
-     * See PERFORMANCE_AUDIT_2026-08-27 #1. No-op if the file has since vanished.
-     */
+    /** Re-index a single already-known file the caller just wrote. */
     suspend fun reindexOne(fileName: String, text: String, conflictFileName: String?) {
         val stat = store.stat(fileName) ?: return
-        index.indexNotebook(
-            fileName = fileName,
-            revision = revision(stat),
-            text = text,
-            lastModified = stat.lastModified,
-            conflictFileName = conflictFileName,
-        )
+        index.indexNotebook(fileName, revision(stat), text, stat.lastModified, conflictFileName)
     }
+
+    private fun isSupportedSource(name: String): Boolean =
+        (name.endsWith(".org", ignoreCase = true) || name.endsWith(".md", ignoreCase = true)) &&
+            !name.contains(".sync-conflict-", ignoreCase = true)
 }
